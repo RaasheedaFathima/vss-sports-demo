@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+*.egg
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Kubernetes secrets — NEVER commit filled-in secrets
+k8s/secret.yaml
+
+# Report outputs
+reports/*.pdf
+
+# Uploaded videos and analysis cache
+uploads/
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# fastembed model cache
+fastembed-cache/
+
+# Terraform (if run locally)
+*.tfvars
+*.tfstate
+*.tfstate.backup
+.terraform/
+
+# Docker
+.dockerignore
+
+# Logs
+*.log

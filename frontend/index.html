@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VSS2 — Video Search & Summarization</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:#060d1e;color:#e2e8f0;min-height:100vh}
+h1{font-size:1.25rem;font-weight:700;letter-spacing:-.02em}
+h2{font-size:.9rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;margin-bottom:12px}
+h3{font-size:.85rem;font-weight:600;color:#cbd5e1;margin-bottom:6px}
+label{font-size:.8rem;color:#94a3b8;display:block;margin-bottom:4px}
+input,select,textarea{width:100%;background:#0f1a30;border:1px solid #1e3055;border-radius:8px;color:#e2e8f0;padding:8px 10px;font-size:.85rem;outline:none;transition:border-color .2s}
+input:focus,select:focus,textarea:focus{border-color:#3b82f6}
+textarea{resize:vertical;min-height:60px}
+button{cursor:pointer;border:none;border-radius:8px;font-size:.82rem;font-weight:600;padding:8px 14px;transition:all .15s}
+.btn-primary{background:#2563eb;color:#fff}
+.btn-primary:hover{background:#1d4ed8}
+.btn-primary:disabled{background:#1e3055;color:#64748b;cursor:not-allowed}
+.btn-danger{background:#7f1d1d;color:#fca5a5}
+.btn-danger:hover{background:#991b1b}
+.btn-ghost{background:#1e2a3a;color:#94a3b8}
+.btn-ghost:hover{background:#243447}
+.btn-sm{padding:5px 10px;font-size:.78rem}
+.card{background:#0b1628;border:1px solid #1a2a45;border-radius:14px;padding:16px;margin-bottom:14px}
+.badge{display:inline-block;border-radius:20px;padding:2px 9px;font-size:.72rem;font-weight:600;letter-spacing:.03em}
+.badge-pending{background:#1e3a5f;color:#60a5fa}
+.badge-analysing{background:#1a3040;color:#38bdf8}
+.badge-ready{background:#14532d;color:#4ade80}
+.badge-error{background:#450a0a;color:#f87171}
+.small{font-size:.78rem}
+.muted{color:#64748b}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+/* Layout */
+.header{display:flex;align-items:center;justify-content:space-between;padding:12px 20px;background:#071020;border-bottom:1px solid #1a2a45;position:sticky;top:0;z-index:100}
+.pills{display:flex;gap:8px}
+.pill{background:#111f38;border:1px solid #1e3055;border-radius:20px;padding:3px 12px;font-size:.75rem;color:#7dd3fc}
+.layout{display:grid;grid-template-columns:280px 1fr 320px;gap:14px;padding:14px;height:calc(100vh - 52px);overflow:hidden}
+.col{overflow-y:auto;padding-right:4px}
+.col::-webkit-scrollbar{width:4px}
+.col::-webkit-scrollbar-track{background:transparent}
+.col::-webkit-scrollbar-thumb{background:#1e3055;border-radius:2px}
+/* Upload */
+.file-drop{border:2px dashed #1e3055;border-radius:10px;padding:20px;text-align:center;cursor:pointer;transition:border-color .2s;margin-bottom:10px}
+.file-drop:hover,.file-drop.drag{border-color:#3b82f6;background:#0f1a30}
+.file-drop input{display:none}
+/* Video list */
+.video-card{background:#0f1a30;border:1px solid #1e3055;border-radius:10px;padding:10px 12px;margin-bottom:8px;cursor:pointer;transition:border-color .2s}
+.video-card:hover{border-color:#2563eb}
+.video-card.active{border-color:#3b82f6;background:#111f38}
+.video-card-name{font-size:.83rem;font-weight:600;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.video-card-meta{font-size:.75rem;color:#64748b;margin-bottom:6px}
+.video-card-actions{display:flex;gap:6px;flex-wrap:wrap}
+/* Progress */
+.progress-bar-track{background:#1e3055;border-radius:3px;height:5px;overflow:hidden;margin-top:4px}
+.progress-bar-fill{height:100%;background:linear-gradient(90deg,#3b82f6,#60a5fa);border-radius:3px;transition:width .5s ease}
+.progress-bar-fill.indeterminate{width:35%!important;animation:slide 1.8s ease-in-out infinite}
+@keyframes slide{0%{transform:translateX(-200%)}100%{transform:translateX(450%)}}
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid #1e3055;border-top-color:#3b82f6;border-radius:50%;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+/* Player */
+#player{width:100%;border-radius:10px;background:#000;max-height:320px}
+.timeline-row{display:flex;align-items:center;gap:8px;margin-top:6px}
+.timeline-row input[type=range]{flex:1}
+.status-bar{display:flex;align-items:center;gap:8px;padding:10px 12px;background:#0f1a30;border-radius:10px;margin-top:10px}
+.status-text{flex:1;font-size:.8rem}
+/* Search */
+.search-box{display:flex;gap:8px;margin-bottom:10px}
+.search-box textarea{flex:1;min-height:40px;max-height:80px}
+.synthesis-card{background:#0d2135;border:1px solid #1e4060;border-radius:10px;padding:12px;margin-bottom:12px;font-size:.83rem;line-height:1.6;white-space:pre-wrap;word-break:break-word}
+.result-card{background:#0f1a30;border:1px solid #1e3055;border-radius:10px;padding:10px 12px;margin-bottom:8px}
+.result-card:hover{border-color:#2563eb}
+.result-card h3{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.similarity-bar{background:#1e3055;border-radius:2px;height:3px;margin:4px 0}
+.similarity-fill{height:100%;background:#3b82f6;border-radius:2px}
+.result-text{font-size:.79rem;color:#94a3b8;margin-top:6px;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
+/* Reanalyse modal overlay */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:200;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal{background:#0b1628;border:1px solid #1e3055;border-radius:16px;padding:24px;width:400px;max-width:95vw}
+.modal h2{margin-bottom:16px}
+.form-group{margin-bottom:12px}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="row" style="gap:12px">
+    <h1>VSS2 — Video Search & Summarization</h1>
+    <span class="small muted">OCI GenAI · pgvector · fastembed</span>
+  </div>
+  <div class="pills">
+    <span class="pill" id="pill-vlm">VLM: —</span>
+    <span class="pill" id="pill-scenario">Scenario: general</span>
+  </div>
+</div>
+
+<div class="layout">
+
+  <!-- ── Column 1: Upload + Library ───────────────────────────────────── -->
+  <div class="col" id="col-left">
+
+    <div class="card">
+      <h2>Upload Video</h2>
+      <div class="file-drop" id="file-drop" onclick="document.getElementById('file-input').click()">
+        <input type="file" id="file-input" accept="video/*">
+        <div id="file-label" class="muted small">Click or drag a video file here</div>
+      </div>
+      <div class="form-group">
+        <label>VLM Model</label>
+        <select id="upload-vlm"></select>
+      </div>
+      <div class="form-group">
+        <label>Analysis Scenario</label>
+        <select id="upload-scenario"></select>
+      </div>
+      <details style="margin-bottom:10px">
+        <summary style="font-size:.8rem;color:#94a3b8;cursor:pointer">Custom Prompt (overrides scenario)</summary>
+        <div style="margin-top:8px">
+          <textarea id="custom-prompt" placeholder="Enter custom analysis prompt (max 800 chars)..." maxlength="800"></textarea>
+        </div>
+      </details>
+      <details style="margin-bottom:12px">
+        <summary style="font-size:.8rem;color:#94a3b8;cursor:pointer">Video Metadata (optional)</summary>
+        <div style="margin-top:8px;display:flex;flex-direction:column;gap:8px">
+          <div><label>Camera ID</label><input id="upload-camera" placeholder="e.g. cam-01"></div>
+          <div><label>Location</label><input id="upload-location" placeholder="e.g. main-entrance"></div>
+          <div><label>Capture Type</label><input id="upload-capture" placeholder="e.g. traffic, retail, sports"></div>
+        </div>
+      </details>
+      <button class="btn-primary" id="upload-btn" style="width:100%" disabled>Upload & Analyse</button>
+      <div id="upload-status" class="small muted" style="margin-top:8px;text-align:center"></div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="justify-content:space-between;margin-bottom:12px">
+        <h2 style="margin:0">Library</h2>
+        <span class="badge badge-ready" id="library-count">0 videos</span>
+      </div>
+      <div id="video-list"><div class="muted small" style="text-align:center;padding:20px">No videos yet</div></div>
+    </div>
+  </div>
+
+  <!-- ── Column 2: Player ──────────────────────────────────────────────── -->
+  <div class="col" id="col-center">
+    <div class="card">
+      <h2>Video Player</h2>
+      <video id="player" controls preload="metadata"></video>
+      <div class="timeline-row">
+        <span class="small muted" id="time-now">0.0s</span>
+        <input type="range" id="timeline" min="0" max="0" step="0.1" value="0">
+        <span class="small muted" id="time-total">0.0s</span>
+      </div>
+      <div class="row" style="margin-top:8px;gap:6px">
+        <button class="btn-ghost btn-sm" onclick="seekRel(-5)">-5s</button>
+        <button class="btn-ghost btn-sm" onclick="player.paused?player.play():player.pause()">⏯</button>
+        <button class="btn-ghost btn-sm" onclick="seekRel(5)">+5s</button>
+        <span id="active-video-name" class="small muted" style="flex:1;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+      </div>
+
+      <div id="status-bar" class="status-bar" style="display:none">
+        <div class="spinner" id="status-spinner" style="display:none"></div>
+        <div class="status-text" id="status-text">—</div>
+        <button class="btn-ghost btn-sm" id="reanalyse-btn" style="display:none" onclick="openReanalyse()">Re-analyse</button>
+      </div>
+      <div id="progress-wrap" style="display:none;padding:0 0 4px">
+        <div class="progress-bar-track"><div class="progress-bar-fill" id="progress-fill"></div></div>
+      </div>
+    </div>
+
+    <div class="card" id="analysis-text-card" style="display:none">
+      <h2>Analysis Summary</h2>
+      <div id="analysis-text" class="small" style="line-height:1.7;white-space:pre-wrap;max-height:300px;overflow-y:auto"></div>
+    </div>
+  </div>
+
+  <!-- ── Column 3: Search ──────────────────────────────────────────────── -->
+  <div class="col" id="col-right">
+    <div class="card">
+      <h2>Semantic Search</h2>
+      <div class="search-box">
+        <textarea id="search-query" rows="2" placeholder="Search all analysed videos…"></textarea>
+        <button class="btn-primary" id="search-btn" onclick="doSearch()" disabled>Search</button>
+      </div>
+      <div class="form-group">
+        <label>Synthesis LLM</label>
+        <select id="search-llm"></select>
+      </div>
+      <details style="margin-bottom:12px">
+        <summary style="font-size:.8rem;color:#94a3b8;cursor:pointer">Filters</summary>
+        <div style="margin-top:8px;display:flex;flex-direction:column;gap:8px">
+          <div><label>Camera ID</label><input id="filter-camera" placeholder="any"></div>
+          <div><label>Location</label><input id="filter-location" placeholder="any"></div>
+          <div><label>Scenario</label><select id="filter-scenario"><option value="">Any scenario</option></select></div>
+          <div><label>Min Similarity</label>
+            <input type="range" id="filter-sim" min="0" max="0.9" step="0.05" value="0">
+            <span class="small muted" id="filter-sim-label">0.0</span>
+          </div>
+        </div>
+      </details>
+
+      <div id="search-spinner" style="display:none;text-align:center;padding:20px">
+        <div class="spinner" style="width:24px;height:24px;margin:0 auto"></div>
+        <div class="small muted" style="margin-top:8px">Searching…</div>
+      </div>
+
+      <div id="search-results" style="display:none">
+        <div id="synthesis-wrap" style="display:none">
+          <h2>AI Synthesis</h2>
+          <div class="synthesis-card" id="synthesis-text"></div>
+        </div>
+        <div class="row" style="justify-content:space-between;margin-bottom:8px">
+          <h2 style="margin:0">Results</h2>
+          <span class="small muted" id="results-meta"></span>
+        </div>
+        <div id="results-list"></div>
+      </div>
+
+      <div id="search-empty" class="muted small" style="text-align:center;padding:30px">
+        Search across all analysed videos
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Re-analyse modal -->
+<div class="modal-overlay" id="reanalyse-modal">
+  <div class="modal">
+    <h2>Re-analyse Video</h2>
+    <div class="form-group">
+      <label>VLM Model</label>
+      <select id="modal-vlm"></select>
+    </div>
+    <div class="form-group">
+      <label>Scenario</label>
+      <select id="modal-scenario"></select>
+    </div>
+    <div class="form-group">
+      <label>Custom Prompt (optional)</label>
+      <textarea id="modal-prompt" placeholder="Override scenario with custom prompt…" maxlength="800"></textarea>
+    </div>
+    <div class="row" style="gap:8px;justify-content:flex-end;margin-top:16px">
+      <button class="btn-ghost" onclick="closeReanalyse()">Cancel</button>
+      <button class="btn-primary" onclick="submitReanalyse()">Start Analysis</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const state = {
+  videos: [],
+  selectedVideoId: null,
+  modelLabels: {},
+  scenarios: [],
+  pollTimer: null,
+};
+
+const player    = document.getElementById('player');
+const timeline  = document.getElementById('timeline');
+const timeNow   = document.getElementById('time-now');
+const timeTotal = document.getElementById('time-total');
+
+// ── Bootstrap ────────────────────────────────────────────────────────────────
+async function init() {
+  await Promise.all([loadModels(), loadScenarios()]);
+  await refreshLibrary();
+  startLibraryPoll();
+}
+
+async function loadModels() {
+  const d = await fetch('/api/models').then(r => r.json());
+  const vlmSel   = document.getElementById('upload-vlm');
+  const llmSel   = document.getElementById('search-llm');
+  const modalVlm = document.getElementById('modal-vlm');
+  d.vlmModels.forEach(m => {
+    state.modelLabels[m.id] = m.label;
+    vlmSel.append(new Option(m.label, m.id));
+    modalVlm.append(new Option(m.label, m.id));
+  });
+  d.llmModels.forEach(m => {
+    state.modelLabels[m.id] = m.label;
+    llmSel.append(new Option(m.label, m.id));
+  });
+  document.getElementById('pill-vlm').textContent = `VLM: ${d.vlmModels[0]?.label || '—'}`;
+  document.getElementById('upload-vlm').addEventListener('change', () => {
+    document.getElementById('pill-vlm').textContent =
+      `VLM: ${state.modelLabels[document.getElementById('upload-vlm').value] || '—'}`;
+  });
+}
+
+async function loadScenarios() {
+  const d = await fetch('/api/scenarios').then(r => r.json());
+  state.scenarios = d.scenarios;
+  const sels = ['upload-scenario','modal-scenario','filter-scenario'];
+  sels.forEach(id => {
+    const el = document.getElementById(id);
+    if (id === 'filter-scenario') el.innerHTML = '<option value="">Any scenario</option>';
+    d.scenarios.forEach(s => el.append(new Option(s.label, s.id)));
+  });
+  document.getElementById('upload-scenario').addEventListener('change', () => {
+    document.getElementById('pill-scenario').textContent =
+      `Scenario: ${document.getElementById('upload-scenario').value}`;
+  });
+}
+
+// ── File drop ────────────────────────────────────────────────────────────────
+const fileDrop  = document.getElementById('file-drop');
+const fileInput = document.getElementById('file-input');
+const uploadBtn = document.getElementById('upload-btn');
+let selectedFile = null;
+
+fileInput.addEventListener('change', () => {
+  selectedFile = fileInput.files[0];
+  document.getElementById('file-label').textContent = selectedFile?.name || 'No file selected';
+  uploadBtn.disabled = !selectedFile;
+});
+fileDrop.addEventListener('dragover', e => { e.preventDefault(); fileDrop.classList.add('drag'); });
+fileDrop.addEventListener('dragleave', () => fileDrop.classList.remove('drag'));
+fileDrop.addEventListener('drop', e => {
+  e.preventDefault(); fileDrop.classList.remove('drag');
+  if (e.dataTransfer.files[0]) {
+    selectedFile = e.dataTransfer.files[0];
+    document.getElementById('file-label').textContent = selectedFile.name;
+    uploadBtn.disabled = false;
+  }
+});
+
+uploadBtn.addEventListener('click', async () => {
+  if (!selectedFile) return;
+  uploadBtn.disabled = true;
+  const statusEl = document.getElementById('upload-status');
+  statusEl.textContent = 'Uploading…';
+  const form = new FormData();
+  form.append('file', selectedFile);
+  form.append('vlm_model', document.getElementById('upload-vlm').value);
+  form.append('scenario', document.getElementById('upload-scenario').value);
+  form.append('custom_prompt', document.getElementById('custom-prompt').value);
+  form.append('camera_id', document.getElementById('upload-camera').value);
+  form.append('location', document.getElementById('upload-location').value);
+  form.append('capture_type', document.getElementById('upload-capture').value);
+  try {
+    const d = await fetch('/api/upload', { method: 'POST', body: form }).then(r => r.json());
+    if (d.videoId) {
+      statusEl.textContent = `Uploaded — analysis started`;
+      selectedFile = null;
+      fileInput.value = '';
+      document.getElementById('file-label').textContent = 'Click or drag a video file here';
+      await refreshLibrary();
+      selectVideo(d.videoId);
+    } else {
+      statusEl.textContent = `Error: ${JSON.stringify(d)}`;
+    }
+  } catch (e) {
+    statusEl.textContent = `Upload failed: ${e}`;
+  } finally {
+    uploadBtn.disabled = false;
+  }
+});
+
+// ── Library ──────────────────────────────────────────────────────────────────
+function startLibraryPoll() {
+  if (state.pollTimer) clearInterval(state.pollTimer);
+  state.pollTimer = setInterval(async () => {
+    await refreshLibrary();
+    if (state.selectedVideoId) await refreshSelectedStatus();
+  }, 3000);
+}
+
+async function refreshLibrary() {
+  try {
+    const d = await fetch('/api/videos').then(r => r.json());
+    state.videos = d.videos || [];
+    renderLibrary();
+    // Enable search if there are ready videos
+    const hasReady = state.videos.some(v => v.status === 'ready');
+    document.getElementById('search-btn').disabled = !hasReady;
+  } catch {}
+}
+
+function renderLibrary() {
+  const list = document.getElementById('video-list');
+  const count = document.getElementById('library-count');
+  count.textContent = `${state.videos.length} video${state.videos.length !== 1 ? 's' : ''}`;
+  if (state.videos.length === 0) {
+    list.innerHTML = '<div class="muted small" style="text-align:center;padding:20px">No videos yet</div>';
+    return;
+  }
+  list.innerHTML = state.videos.map(v => {
+    const active = v.id === state.selectedVideoId ? ' active' : '';
+    const badge = `<span class="badge badge-${v.status}">${v.status}</span>`;
+    const prog = (v.status === 'analysing' && v.total_batches > 0)
+      ? `<div class="progress-bar-track" style="margin-top:4px">
+           <div class="progress-bar-fill" style="width:${Math.round(v.batch_done/v.total_batches*100)}%"></div>
+         </div>
+         <div class="small muted" style="margin-top:2px">Batch ${v.batch_done}/${v.total_batches}</div>`
+      : (v.status === 'analysing' ? `<div class="progress-bar-track" style="margin-top:4px">
+           <div class="progress-bar-fill indeterminate"></div></div>` : '');
+    const dur = v.duration > 0 ? ` · ${v.duration.toFixed(1)}s` : '';
+    const meta = [v.scenario, v.camera_id, v.location].filter(Boolean).join(' · ');
+    return `<div class="video-card${active}" onclick="selectVideo('${v.id}')">
+      <div class="video-card-name" title="${v.filename}">${v.filename}</div>
+      <div class="video-card-meta">${state.modelLabels[v.vlm_model]?.split(' ')[1] || v.vlm_model.slice(-6)}${dur}</div>
+      <div class="row" style="margin-bottom:4px;gap:6px">${badge}${meta ? `<span class="small muted">${meta}</span>` : ''}</div>
+      ${prog}
+      <div class="video-card-actions" onclick="event.stopPropagation()">
+        <button class="btn-ghost btn-sm" onclick="selectVideo('${v.id}')">▶ Play</button>
+        <button class="btn-ghost btn-sm" onclick="openReanalyseFor('${v.id}')">↻ Re-analyse</button>
+        <button class="btn-danger btn-sm" onclick="deleteVideo('${v.id}')">🗑</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ── Video selection & playback ────────────────────────────────────────────────
+function selectVideo(videoId) {
+  state.selectedVideoId = videoId;
+  const v = state.videos.find(x => x.id === videoId);
+  if (!v) return;
+  renderLibrary();
+  document.getElementById('active-video-name').textContent = v.filename;
+  player.src = `/api/videos/${videoId}/file`;
+  player.load();
+  timeline.value = 0;
+  timeline.max = v.duration || 0;
+  timeTotal.textContent = `${(v.duration || 0).toFixed(1)}s`;
+  document.getElementById('status-bar').style.display = 'flex';
+  renderStatus(v);
+}
+
+async function refreshSelectedStatus() {
+  if (!state.selectedVideoId) return;
+  try {
+    const d = await fetch(`/api/videos/${state.selectedVideoId}/status`).then(r => r.json());
+    // Update in state.videos
+    const idx = state.videos.findIndex(v => v.id === state.selectedVideoId);
+    if (idx >= 0) Object.assign(state.videos[idx], d);
+    renderStatus(d);
+    renderLibrary();
+  } catch {}
+}
+
+function renderStatus(v) {
+  const spinner   = document.getElementById('status-spinner');
+  const text      = document.getElementById('status-text');
+  const btn       = document.getElementById('reanalyse-btn');
+  const progWrap  = document.getElementById('progress-wrap');
+  const fill      = document.getElementById('progress-fill');
+  const analysisCard = document.getElementById('analysis-text-card');
+
+  const isPending  = v.status === 'pending';
+  const isAnalysing = v.status === 'analysing';
+  const isReady    = v.status === 'ready';
+  const isError    = v.status === 'error';
+  const inProgress = isPending || isAnalysing;
+  const vlmLabel   = state.modelLabels[v.vlm_model] || v.vlm_model;
+
+  spinner.style.display    = inProgress ? 'block' : 'none';
+  btn.style.display        = inProgress ? 'none' : 'inline-block';
+  progWrap.style.display   = inProgress ? 'block' : 'none';
+
+  if (isAnalysing && v.total_batches > 0) {
+    const pct = Math.round(v.batch_done / v.total_batches * 100);
+    fill.classList.remove('indeterminate');
+    fill.style.width = pct + '%';
+    const etaStr = v.eta != null ? ` — ~${fmtDur(v.eta)} remaining` : '';
+    text.textContent = `${vlmLabel} — batch ${v.batch_done}/${v.total_batches} (${pct}%)${etaStr}`;
+  } else if (inProgress) {
+    fill.classList.add('indeterminate');
+    text.textContent = `${vlmLabel} — ${isPending ? 'queued…' : 'extracting frames…'}`;
+  } else if (isReady) {
+    fill.classList.remove('indeterminate');
+    fill.style.width = '100%';
+    text.textContent = `Analysis complete — ${v.frames} frames, ${Number(v.duration).toFixed(1)}s — ${vlmLabel}`;
+  } else if (isError) {
+    text.textContent = `Analysis failed: ${(v.error || '').slice(0, 100)}`;
+  }
+
+  analysisCard.style.display = 'none';
+}
+
+function fmtDur(sec) {
+  if (!sec || sec < 1) return '…';
+  if (sec < 60) return `${Math.round(sec)}s`;
+  return `${Math.floor(sec / 60)}m ${Math.round(sec % 60)}s`;
+}
+
+// Player controls
+player.addEventListener('timeupdate', () => {
+  timeNow.textContent = `${player.currentTime.toFixed(1)}s`;
+  timeline.value = player.currentTime;
+});
+player.addEventListener('loadedmetadata', () => {
+  timeline.max = player.duration;
+  timeTotal.textContent = `${player.duration.toFixed(1)}s`;
+});
+timeline.addEventListener('input', () => { player.currentTime = timeline.value; });
+function seekRel(d) { player.currentTime = Math.max(0, player.currentTime + d); }
+function seekTo(t)  { player.currentTime = t; player.play(); }
+
+// ── Delete video ─────────────────────────────────────────────────────────────
+async function deleteVideo(videoId) {
+  if (!confirm('Delete this video and all its analysis data?')) return;
+  await fetch(`/api/videos/${videoId}`, { method: 'DELETE' });
+  if (state.selectedVideoId === videoId) {
+    state.selectedVideoId = null;
+    player.src = '';
+    document.getElementById('status-bar').style.display = 'none';
+    document.getElementById('active-video-name').textContent = '';
+  }
+  await refreshLibrary();
+}
+
+// ── Re-analyse modal ─────────────────────────────────────────────────────────
+let reanalyseVideoId = null;
+function openReanalyse() { openReanalyseFor(state.selectedVideoId); }
+function openReanalyseFor(videoId) {
+  reanalyseVideoId = videoId;
+  document.getElementById('reanalyse-modal').classList.add('open');
+}
+function closeReanalyse() {
+  document.getElementById('reanalyse-modal').classList.remove('open');
+  reanalyseVideoId = null;
+}
+async function submitReanalyse() {
+  if (!reanalyseVideoId) return;
+  const form = new FormData();
+  form.append('vlm_model',     document.getElementById('modal-vlm').value);
+  form.append('scenario',      document.getElementById('modal-scenario').value);
+  form.append('custom_prompt', document.getElementById('modal-prompt').value);
+  closeReanalyse();
+  await fetch(`/api/videos/${reanalyseVideoId}/reanalyse`, { method: 'POST', body: form });
+  await refreshLibrary();
+  if (state.selectedVideoId === reanalyseVideoId) await refreshSelectedStatus();
+}
+document.getElementById('reanalyse-modal').addEventListener('click', e => {
+  if (e.target === document.getElementById('reanalyse-modal')) closeReanalyse();
+});
+
+// ── Search ───────────────────────────────────────────────────────────────────
+document.getElementById('search-query').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doSearch(); }
+});
+document.getElementById('filter-sim').addEventListener('input', function() {
+  document.getElementById('filter-sim-label').textContent = parseFloat(this.value).toFixed(2);
+});
+
+async function doSearch() {
+  const query = document.getElementById('search-query').value.trim();
+  if (!query) return;
+  document.getElementById('search-spinner').style.display = 'block';
+  document.getElementById('search-results').style.display = 'none';
+  document.getElementById('search-empty').style.display = 'none';
+  document.getElementById('search-btn').disabled = true;
+
+  try {
+    const d = await fetch('/api/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query,
+        top_k: 10,
+        llm_model:      document.getElementById('search-llm').value,
+        use_llm:        true,
+        min_similarity: parseFloat(document.getElementById('filter-sim').value),
+        camera_id:      document.getElementById('filter-camera').value.trim(),
+        location:       document.getElementById('filter-location').value.trim(),
+        scenario:       document.getElementById('filter-scenario').value,
+      }),
+    }).then(r => r.json());
+
+    renderSearchResults(d);
+  } catch (e) {
+    document.getElementById('search-empty').textContent = `Search failed: ${e}`;
+    document.getElementById('search-empty').style.display = 'block';
+  } finally {
+    document.getElementById('search-spinner').style.display = 'none';
+    document.getElementById('search-btn').disabled = false;
+  }
+}
+
+function renderSearchResults(d) {
+  const resultsDiv = document.getElementById('search-results');
+  resultsDiv.style.display = 'block';
+
+  // Synthesis
+  const synthWrap = document.getElementById('synthesis-wrap');
+  const synthText = document.getElementById('synthesis-text');
+  if (d.synthesis) {
+    synthWrap.style.display = 'block';
+    synthText.textContent = d.synthesis;
+  } else {
+    synthWrap.style.display = 'none';
+  }
+
+  // Meta
+  document.getElementById('results-meta').textContent =
+    `${d.total} results · embed ${d.embed_ms}ms · search ${d.search_ms}ms` +
+    (d.llm_ms > 0 ? ` · LLM ${d.llm_ms}ms` : '');
+
+  // Result cards
+  const list = document.getElementById('results-list');
+  if (!d.results || d.results.length === 0) {
+    list.innerHTML = '<div class="muted small" style="padding:20px;text-align:center">No matching segments found</div>';
+    return;
+  }
+  list.innerHTML = d.results.map((r, i) => {
+    const pct = Math.round(r.similarity * 100);
+    const ts = `${r.segment_start.toFixed(0)}s – ${r.segment_end.toFixed(0)}s`;
+    const excerpt = (r.chunk_text || '').replace(/=== Segment.*?===/g, '').trim().slice(0, 250);
+    return `<div class="result-card">
+      <h3>
+        <span style="font-size:.82rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1" title="${r.filename}">${r.filename}</span>
+        <span class="badge badge-ready" style="flex-shrink:0">${pct}%</span>
+      </h3>
+      <div class="small muted" style="margin-bottom:4px">${ts} · ${r.scenario} · ${state.modelLabels[r.vlm_model]?.split(' ')[1] || ''}</div>
+      <div class="similarity-bar"><div class="similarity-fill" style="width:${pct}%"></div></div>
+      <div class="result-text">${excerpt}</div>
+      <div class="row" style="margin-top:8px;gap:6px">
+        <button class="btn-ghost btn-sm" onclick="jumpTo('${r.video_id}',${r.segment_start})">▶ Jump to ${r.segment_start.toFixed(0)}s</button>
+        ${r.camera_id ? `<span class="small muted">📷 ${r.camera_id}</span>` : ''}
+        ${r.location  ? `<span class="small muted">📍 ${r.location}</span>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function jumpTo(videoId, t) {
+  if (state.selectedVideoId !== videoId) {
+    await selectVideo(videoId);
+    // wait for video to load
+    await new Promise(resolve => {
+      player.addEventListener('loadedmetadata', resolve, { once: true });
+      setTimeout(resolve, 3000);
+    });
+  }
+  seekTo(t);
+  document.getElementById('col-center').scrollIntoView({ behavior: 'smooth' });
+}
+
+init();
+</script>
+</body>
+</html>

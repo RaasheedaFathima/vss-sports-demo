@@ -1,0 +1,58 @@
+# VSS2 Worker — Deployment
+# Worker pods poll the database for pending video jobs and process them in parallel.
+# Multiple replicas are safe thanks to SELECT FOR UPDATE SKIP LOCKED.
+# The HPA (hpa.yaml) autoscales this deployment based on CPU utilisation.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vss2-worker
+  namespace: default
+spec:
+  replicas: 1    # The HPA will override this based on load
+  selector:
+    matchLabels:
+      app: vss2-worker
+  template:
+    metadata:
+      labels:
+        app: vss2-worker
+    spec:
+      containers:
+        - name: vss2-worker
+          # Replace with your image registry path
+          image: <YOUR_REGISTRY>/vss2-worker:latest
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: vss2-app-config
+          env:
+            - name: PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: vss2-app-secret
+                  key: PG_PASSWORD
+            - name: NVIDIA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vss2-app-secret
+                  key: NVIDIA_API_KEY
+            - name: LOCAL_COSMOS_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vss2-app-secret
+                  key: LOCAL_COSMOS_API_KEY
+          volumeMounts:
+            - name: fss
+              mountPath: /mnt/fss
+          resources:
+            requests:
+              cpu: "1"          # CPU-intensive: ffmpeg + fastembed
+              memory: 1Gi
+            limits:
+              cpu: "4"
+              memory: 4Gi
+      volumes:
+        - name: fss
+          persistentVolumeClaim:
+            claimName: vss-fss-pvc   # Shared NFS PVC (same as app pod)

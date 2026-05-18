@@ -1,0 +1,74 @@
+# PostgreSQL with pgvector extension
+# This is a simple single-replica deployment suitable for demos.
+# For production use a managed database (e.g. OCI Database Service).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vss2-postgres
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vss2-postgres
+  template:
+    metadata:
+      labels:
+        app: vss2-postgres
+    spec:
+      containers:
+        - name: vss2-postgres
+          image: pgvector/pgvector:pg16
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: "vss2_db"
+            - name: POSTGRES_USER
+              value: "vss2_user"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: vss2-app-secret
+                  key: PG_PASSWORD
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+      volumes:
+        - name: pgdata
+          persistentVolumeClaim:
+            claimName: vss2-postgres-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vss2-postgres
+  namespace: default
+spec:
+  selector:
+    app: vss2-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+# Persistent volume for postgres data (adjust storageClassName for your cluster)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vss2-postgres-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: oci-bv   # OCI block volume — change as needed

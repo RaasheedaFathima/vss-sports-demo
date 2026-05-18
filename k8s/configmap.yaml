@@ -1,0 +1,38 @@
+# VSS2 ConfigMap — non-secret configuration
+# Replace all <YOUR_...> placeholders before applying.
+# See README.md for full setup instructions.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vss2-app-config
+  namespace: default
+data:
+  # PostgreSQL connection (matches vss2-postgres service)
+  PG_HOST: "vss2-postgres"
+  PG_PORT: "5432"
+  PG_DB: "vss2_db"
+  PG_USER: "vss2_user"
+
+  # Shared storage paths (NFS PVC must be pre-provisioned)
+  UPLOADS_DIR: "/mnt/fss/vss2/uploads"
+  FASTEMBED_CACHE_DIR: "/mnt/fss/vss2/fastembed-cache"
+
+  # OCI tenancy details
+  COMPARTMENT_ID: "<YOUR_OCI_COMPARTMENT_OCID>"
+
+  # OCI GenAI model OCIDs (Phoenix region)
+  # Find these in: OCI Console → Generative AI → Models
+  GEMINI_25_PRO_OCID: "<YOUR_GEMINI_25_PRO_OCID>"
+  GEMINI_25_FLASH_OCID: "<YOUR_GEMINI_25_FLASH_OCID>"
+  COHERE_CMD_A_VISION: "<YOUR_COHERE_CMD_A_VISION_OCID>"
+  COHERE_CMD_A_TEXT: "<YOUR_COHERE_CMD_A_TEXT_OCID>"
+
+  # NVIDIA NIM settings (leave NVIDIA_NIM_ENDPOINT as-is for public NIM)
+  COSMOS_REASON2_MODEL: "nvidia/cosmos-reason2-8b"
+  NVIDIA_NIM_ENDPOINT: "https://integrate.api.nvidia.com/v1/chat/completions"
+
+  # Local / self-hosted Cosmos-Reason2 NIM endpoint (optional)
+  # Set to empty string to disable. Example:
+  # LOCAL_COSMOS_ENDPOINT: "http://cosmos-nim.default.svc.cluster.local:8000/v1/chat/completions"
+  LOCAL_COSMOS_ENDPOINT: ""
+  LOCAL_COSMOS_MODEL: "nvidia/cosmos-reason2-8b"
