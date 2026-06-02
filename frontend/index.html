@@ -162,6 +162,7 @@ button{cursor:pointer;border:none;border-radius:8px;font-size:.82rem;font-weight
       <div id="status-bar" class="status-bar" style="display:none">
         <div class="spinner" id="status-spinner" style="display:none"></div>
         <div class="status-text" id="status-text">—</div>
+        <button class="btn-primary btn-sm" id="analysis-btn" style="display:none" onclick="showAnalysis()">View analysis</button>
         <button class="btn-ghost btn-sm" id="reanalyse-btn" style="display:none" onclick="openReanalyse()">Re-analyse</button>
       </div>
       <div id="progress-wrap" style="display:none;padding:0 0 4px">
@@ -253,6 +254,7 @@ const state = {
   selectedVideoId: null,
   modelLabels: {},
   scenarios: [],
+  summaryCache: {},
   pollTimer: null,
 };
 
@@ -426,6 +428,7 @@ function selectVideo(videoId) {
   timeTotal.textContent = `${(v.duration || 0).toFixed(1)}s`;
   document.getElementById('status-bar').style.display = 'flex';
   renderStatus(v);
+  if (v.status === 'ready') loadAnalysisSummary(videoId);
 }
 
 async function refreshSelectedStatus() {
@@ -436,6 +439,7 @@ async function refreshSelectedStatus() {
     const idx = state.videos.findIndex(v => v.id === state.selectedVideoId);
     if (idx >= 0) Object.assign(state.videos[idx], d);
     renderStatus(d);
+    if (d.status === 'ready') loadAnalysisSummary(state.selectedVideoId);
     renderLibrary();
   } catch {}
 }
@@ -444,9 +448,11 @@ function renderStatus(v) {
   const spinner   = document.getElementById('status-spinner');
   const text      = document.getElementById('status-text');
   const btn       = document.getElementById('reanalyse-btn');
+  const analysisBtn = document.getElementById('analysis-btn');
   const progWrap  = document.getElementById('progress-wrap');
   const fill      = document.getElementById('progress-fill');
   const analysisCard = document.getElementById('analysis-text-card');
+  const analysisText = document.getElementById('analysis-text');
 
   const isPending  = v.status === 'pending';
   const isAnalysing = v.status === 'analysing';
@@ -457,6 +463,7 @@ function renderStatus(v) {
 
   spinner.style.display    = inProgress ? 'block' : 'none';
   btn.style.display        = inProgress ? 'none' : 'inline-block';
+  analysisBtn.style.display = isReady ? 'inline-block' : 'none';
   progWrap.style.display   = inProgress ? 'block' : 'none';
 
   if (isAnalysing && v.total_batches > 0) {
@@ -465,18 +472,98 @@ function renderStatus(v) {
     fill.style.width = pct + '%';
     const etaStr = v.eta != null ? ` — ~${fmtDur(v.eta)} remaining` : '';
     text.textContent = `${vlmLabel} — batch ${v.batch_done}/${v.total_batches} (${pct}%)${etaStr}`;
+    analysisCard.style.display = 'none';
   } else if (inProgress) {
     fill.classList.add('indeterminate');
     text.textContent = `${vlmLabel} — ${isPending ? 'queued…' : 'extracting frames…'}`;
+    analysisCard.style.display = 'none';
   } else if (isReady) {
     fill.classList.remove('indeterminate');
     fill.style.width = '100%';
     text.textContent = `Analysis complete — ${v.frames} frames, ${Number(v.duration).toFixed(1)}s — ${vlmLabel}`;
+    analysisCard.style.display = 'block';
+    if (!analysisText.textContent.trim() || analysisText.dataset.videoId !== state.selectedVideoId) {
+      analysisText.dataset.videoId = state.selectedVideoId || '';
+      analysisText.textContent = 'Loading analysis summary...';
+    }
   } else if (isError) {
     text.textContent = `Analysis failed: ${(v.error || '').slice(0, 100)}`;
+    analysisCard.style.display = 'none';
+  }
+}
+
+async function loadAnalysisSummary(videoId) {
+  if (!videoId) return;
+  const analysisCard = document.getElementById('analysis-text-card');
+  const analysisText = document.getElementById('analysis-text');
+  analysisCard.style.display = 'block';
+  analysisText.dataset.videoId = videoId;
+  if (state.summaryCache[videoId]) {
+    analysisText.textContent = state.summaryCache[videoId];
+    return;
+  }
+  analysisText.textContent = 'Loading analysis summary...';
+  try {
+    const d = await fetch(`/api/videos/${videoId}/summary`).then(r => r.json());
+    if (state.selectedVideoId !== videoId) return;
+    const formatted = formatAnalysisSummary(d.summary);
+    state.summaryCache[videoId] = formatted;
+    analysisText.textContent = formatted;
+  } catch (e) {
+    if (state.selectedVideoId === videoId) {
+      analysisText.textContent = `Could not load analysis summary: ${e}`;
+    }
+  }
+}
+
+async function showAnalysis() {
+  if (!state.selectedVideoId) return;
+  await loadAnalysisSummary(state.selectedVideoId);
+  document.getElementById('analysis-text-card').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function formatAnalysisSummary(summary) {
+  if (!summary) return 'No analysis summary is stored for this video yet.';
+  if (typeof summary === 'string') return summary;
+  if (summary.raw) return String(summary.raw);
+
+  const lines = [];
+  const add = (label, value) => {
+    if (value !== undefined && value !== null && value !== '') lines.push(`${label}: ${value}`);
+  };
+
+  add('Event', summary.event_type);
+  add('Venue', summary.venue);
+  add('Total runners', summary.total_runners);
+  add('Race duration', summary.race_duration_seconds ? `${summary.race_duration_seconds}s` : null);
+  if (summary.winner) {
+    const winner = [summary.winner.name, summary.winner.bib && `bib ${summary.winner.bib}`, summary.winner.finish_time].filter(Boolean).join(' | ');
+    add('Winner', winner || 'Not determinable');
   }
 
-  analysisCard.style.display = 'none';
+  if (Array.isArray(summary.runners) && summary.runners.length) {
+    lines.push('', 'Runners');
+    summary.runners.forEach((runner, idx) => {
+      const id = [runner.name, runner.bib && `bib ${runner.bib}`, runner.country].filter(Boolean).join(' | ') || `Runner ${idx + 1}`;
+      const pos = runner.position ? `position ${runner.position}` : 'position not determined';
+      lines.push(`- ${id}: ${pos}${runner.finish_time ? `, ${runner.finish_time}` : ''}`);
+      const events = Array.isArray(runner.notable_events) ? runner.notable_events : [];
+      events.slice(0, 3).forEach(event => {
+        const eventText = typeof event === 'string' ? event : [event.timestamp, event.event].filter(Boolean).join(' - ');
+        if (eventText) lines.push(`  - ${eventText}`);
+      });
+    });
+  }
+
+  if (Array.isArray(summary.commentary) && summary.commentary.length) {
+    lines.push('', 'Commentary / timeline');
+    summary.commentary.slice(0, 12).forEach(item => {
+      const itemText = typeof item === 'string' ? item : [item.timestamp, item.event || item.description].filter(Boolean).join(' - ');
+      if (itemText) lines.push(`- ${itemText}`);
+    });
+  }
+
+  return lines.length ? lines.join('\n') : JSON.stringify(summary, null, 2);
 }
 
 function fmtDur(sec) {

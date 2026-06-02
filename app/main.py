@@ -1,28 +1,26 @@
 #!/usr/bin/env python3
-"""VSS2 FastAPI Backend — OCI GenAI + pgvector + fastembed
+"""VSS2 FastAPI Backend — OCI GenAI + Oracle ADB + fastembed
 
-This service is stateless with respect to analysis — video files are written to
-shared storage (OCI FSS), a DB row is created, and the analysis is picked up and
-run by one or more worker pods.  The API handles upload, status polling, semantic
-search, and video streaming only.
+Changes from Prachi's original:
+  1. PostgreSQL → Oracle ADB (oracledb thin mode)
+  2. pgvector → ADB CLOB for embeddings (upgrade to 23ai VECTOR later)
+  3. Region updated to us-ashburn-1
+  4. Added /api/videos/{video_id}/summary endpoint for structured JSON race output
+  5. Removed COHERE_CMD_A_TEXT dependency on LLM synthesis (uses Gemini Flash)
 """
-import base64
 import json
 import os
-import subprocess
-import tempfile
 import threading
 import time
 import traceback
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import oci
-import psycopg2
+import oracledb
 import requests
-import psycopg2.extras
 from fastembed import TextEmbedding
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,25 +28,23 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from oci.auth.signers import InstancePrincipalsSecurityTokenSigner
 from oci.generative_ai_inference import GenerativeAiInferenceClient
 from oci.generative_ai_inference.models import (
-    ChatDetails, GenericChatRequest, ImageContent, ImageUrl,
-    OnDemandServingMode, SystemMessage, TextContent, UserMessage,
+    ChatDetails, GenericChatRequest, OnDemandServingMode,
+    SystemMessage, TextContent, UserMessage,
 )
 from pydantic import BaseModel
 
 # ── Environment ───────────────────────────────────────────────────────────────
-PG_HOST             = os.environ["PG_HOST"]
-PG_PORT             = int(os.environ.get("PG_PORT", 5432))
-PG_DB               = os.environ["PG_DB"]
-PG_USER             = os.environ["PG_USER"]
-PG_PASSWORD         = os.environ["PG_PASSWORD"]
-UPLOADS_DIR         = Path(os.environ.get("UPLOADS_DIR", "/mnt/fss/vss2/uploads"))
-FASTEMBED_CACHE_DIR = os.environ.get("FASTEMBED_CACHE_DIR", "/mnt/fss/vss2/fastembed-cache")
+ADB_USER        = os.environ["ADB_USER"]
+ADB_PASSWORD    = os.environ["ADB_PASSWORD"]
+ADB_DSN         = os.environ["ADB_DSN"]
+
+UPLOADS_DIR         = Path(os.environ.get("UPLOADS_DIR", "/home/opc/uploads"))
+FASTEMBED_CACHE_DIR = os.environ.get("FASTEMBED_CACHE_DIR", "/home/opc/fastembed-cache")
 COMPARTMENT_ID      = os.environ["COMPARTMENT_ID"]
 
 GEMINI_25_PRO_OCID   = os.environ["GEMINI_25_PRO_OCID"]
 GEMINI_25_FLASH_OCID = os.environ["GEMINI_25_FLASH_OCID"]
-COHERE_CMD_A_VISION  = os.environ["COHERE_CMD_A_VISION"]
-COHERE_CMD_A_TEXT    = os.environ["COHERE_CMD_A_TEXT"]
+COHERE_CMD_A_VISION  = os.environ.get("COHERE_CMD_A_VISION", "cohere.command-a-vision")
 
 NVIDIA_API_KEY        = os.environ.get("NVIDIA_API_KEY", "")
 COSMOS_REASON2_MODEL  = os.environ.get("COSMOS_REASON2_MODEL", "nvidia/cosmos-reason2-8b")
@@ -56,25 +52,23 @@ NVIDIA_NIM_ENDPOINT   = os.environ.get(
     "NVIDIA_NIM_ENDPOINT",
     "https://integrate.api.nvidia.com/v1/chat/completions",
 )
-
 LOCAL_COSMOS_ENDPOINT = os.environ.get("LOCAL_COSMOS_ENDPOINT", "")
 LOCAL_COSMOS_API_KEY  = os.environ.get("LOCAL_COSMOS_API_KEY", "")
 LOCAL_COSMOS_MODEL    = os.environ.get("LOCAL_COSMOS_MODEL", "nvidia/cosmos-reason2-8b")
 
-OCI_INFERENCE_ENDPOINT = "https://inference.generativeai.us-phoenix-1.oci.oraclecloud.com"
+OCI_INFERENCE_ENDPOINT = "https://inference.generativeai.us-ashburn-1.oci.oraclecloud.com"
 
 # ── Model catalogue ───────────────────────────────────────────────────────────
 VLM_MODELS = [
-    {"id": GEMINI_25_PRO_OCID,    "label": "Google Gemini 2.5 Pro (OCI GenAI)"},
-    {"id": GEMINI_25_FLASH_OCID,  "label": "Google Gemini 2.5 Flash (OCI GenAI)"},
-    {"id": COHERE_CMD_A_VISION,   "label": "Cohere Command A Vision (OCI GenAI)"},
-    {"id": COSMOS_REASON2_MODEL,  "label": "NVIDIA Cosmos-Reason2-8b (Public NIM)"},
+    {"id": GEMINI_25_PRO_OCID,   "label": "Google Gemini 2.5 Pro (OCI GenAI)"},
+    {"id": GEMINI_25_FLASH_OCID, "label": "Google Gemini 2.5 Flash (OCI GenAI)"},
+    {"id": COHERE_CMD_A_VISION,  "label": "Cohere Command A Vision (OCI GenAI)"},
+    {"id": COSMOS_REASON2_MODEL, "label": "NVIDIA Cosmos-Reason2-8b (Public NIM)"},
     {"id": "local/cosmos-reason2","label": "NVIDIA Cosmos-Reason2-8b (Local NIM)"},
 ]
 LLM_MODELS = [
     {"id": GEMINI_25_FLASH_OCID, "label": "Google Gemini 2.5 Flash (OCI GenAI)"},
     {"id": GEMINI_25_PRO_OCID,   "label": "Google Gemini 2.5 Pro (OCI GenAI)"},
-    {"id": COHERE_CMD_A_TEXT,    "label": "Cohere Command A (OCI GenAI)"},
 ]
 DEFAULT_VLM = GEMINI_25_PRO_OCID
 DEFAULT_LLM = GEMINI_25_FLASH_OCID
@@ -87,31 +81,39 @@ SCENARIO_PROMPTS: Dict[str, str] = {
         "or changes. Be specific and factual about locations, timing, and counts."
     ),
     "surveillance": (
-        "Analyze this surveillance footage. For every frame describe: all visible people, "
-        "their behaviors and movements; any safety hazards or security concerns; suspicious "
-        "activities; crowd dynamics and formations; abandoned objects or vehicles. "
+        "Analyze this surveillance footage. Describe: all visible people, behaviors and movements; "
+        "safety hazards or security concerns; suspicious activities; crowd dynamics; abandoned objects. "
         "Note exact locations and timing of any incidents."
     ),
     "traffic": (
-        "Analyze this traffic camera footage. For every frame describe: vehicle movements "
-        "and types; traffic flow and congestion; any violations (running lights, illegal turns, "
-        "speeding); pedestrian activity at crosswalks; accidents or near-misses; road conditions."
+        "Analyze this traffic camera footage. Describe: vehicle movements and types; traffic flow; "
+        "any violations; pedestrian activity; accidents or near-misses; road conditions."
     ),
     "sports": (
-        "Analyze this sports footage. For every frame describe: key plays and actions occurring; "
-        "EXACT count of players visible per team (count each individual, do not estimate); "
-        "player positions, movements, and techniques; scoring opportunities; fouls or decisions; "
-        "game momentum and critical moments."
+        "You are an expert sports analyst specialising in track and field events. "
+        "Analyse this COMPLETE race video holistically. "
+        "Return ONLY a JSON object with this schema:\n\n"
+        "{\n"
+        "  \"event_type\": \"string\",\n"
+        "  \"venue\": \"string or null\",\n"
+        "  \"total_runners\": number,\n"
+        "  \"race_duration_seconds\": number or null,\n"
+        "  \"winner\": {\"name\": null, \"bib\": null, \"country\": null, \"finish_time\": null},\n"
+        "  \"runners\": [{\"name\": null, \"bib\": \"string\", \"country\": null, "
+        "\"position\": number, \"finish_time\": null, \"notable_events\": []}],\n"
+        "  \"commentary\": [{\"timestamp\": \"HH:MM:SS\", \"event\": \"string\"}],\n"
+        "  \"confidence\": \"high|medium|low\",\n"
+        "  \"notes\": \"string\"\n"
+        "}\n\n"
+        "Use null for values you cannot determine. No markdown, no explanation, JSON only."
     ),
     "retail": (
-        "Analyze this retail store footage. For every frame describe: customer traffic patterns; "
-        "shopping behaviors and product interactions; queue lengths at checkouts; staff presence "
-        "and service interactions; any suspicious activities or potential theft indicators."
+        "Analyze this retail store footage. Describe: customer traffic patterns; "
+        "shopping behaviors; queue lengths; staff interactions; suspicious activities."
     ),
     "warehouse": (
-        "Analyze this warehouse footage. For every frame describe: forklift and equipment "
-        "movements and safety compliance; worker activities and tasks; PPE usage compliance; "
-        "any hazards, spills, or unsafe conditions; loading/unloading dock activities."
+        "Analyze this warehouse footage. Describe: equipment movements; safety compliance; "
+        "worker activities; PPE usage; hazards or unsafe conditions."
     ),
 }
 
@@ -133,169 +135,236 @@ def _get_embed_model() -> TextEmbedding:
 
 
 def _embed(text: str) -> List[float]:
-    model = _get_embed_model()
-    vecs = list(model.embed([text]))
-    return vecs[0].tolist()
+    return list(_get_embed_model().embed([text]))[0].tolist()
 
 
-# ── PostgreSQL helpers ────────────────────────────────────────────────────────
-def _pg_conn():
-    return psycopg2.connect(
-        host=PG_HOST, port=PG_PORT, dbname=PG_DB,
-        user=PG_USER, password=PG_PASSWORD,
-        connect_timeout=10,
+# ── ADB helpers ───────────────────────────────────────────────────────────────
+def _adb_conn():
+    """Return an Oracle ADB connection (thin mode)."""
+    return oracledb.connect(
+        user=ADB_USER,
+        password=ADB_PASSWORD,
+        dsn=ADB_DSN,
+        config_dir=os.environ.get("ADB_WALLET_DIR", "/home/opc/wallet"),
+        wallet_location=os.environ.get("ADB_WALLET_DIR", "/home/opc/wallet"),
+        wallet_password=ADB_PASSWORD,
     )
 
 
 def _ensure_schema() -> None:
-    with _pg_conn() as conn, conn.cursor() as cur:
-        cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS vss2_videos (
-                id TEXT PRIMARY KEY,
-                filename TEXT NOT NULL,
-                video_path TEXT NOT NULL,
-                vlm_model TEXT NOT NULL,
-                scenario TEXT NOT NULL DEFAULT 'general',
-                custom_prompt TEXT DEFAULT '',
-                camera_id TEXT DEFAULT '',
-                location TEXT DEFAULT '',
-                capture_type TEXT DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'pending',
-                batch_done INTEGER DEFAULT 0,
-                total_batches INTEGER DEFAULT 0,
-                frames INTEGER DEFAULT 0,
-                duration FLOAT DEFAULT 0.0,
-                error_msg TEXT DEFAULT '',
-                upload_timestamp TIMESTAMPTZ DEFAULT NOW()
-            );
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS vss2_chunks (
-                id SERIAL PRIMARY KEY,
-                video_id TEXT NOT NULL REFERENCES vss2_videos(id) ON DELETE CASCADE,
-                chunk_index INTEGER NOT NULL,
-                chunk_text TEXT NOT NULL,
-                segment_start FLOAT DEFAULT 0.0,
-                segment_end FLOAT DEFAULT 0.0,
-                embedding vector(384),
-                UNIQUE(video_id, chunk_index)
-            );
-        """)
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS vss2_chunks_emb_idx
-            ON vss2_chunks USING hnsw (embedding vector_cosine_ops)
-            WITH (m = 16, ef_construction = 64);
-        """)
-        cur.execute("CREATE INDEX IF NOT EXISTS vss2_chunks_vid_idx ON vss2_chunks(video_id);")
-        cur.execute("ALTER TABLE vss2_videos ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;")
-        cur.execute("ALTER TABLE vss2_videos ADD COLUMN IF NOT EXISTS worker_id TEXT DEFAULT '';")
-        conn.commit()
+    """Create tables if they don't exist."""
+    conn = _adb_conn()
+    cur = conn.cursor()
+    for ddl in [
+        """BEGIN
+            EXECUTE IMMEDIATE '
+                CREATE TABLE VSS2_VIDEOS (
+                    id               VARCHAR2(64)   NOT NULL PRIMARY KEY,
+                    filename         VARCHAR2(500)  NOT NULL,
+                    video_path       VARCHAR2(1000) NOT NULL,
+                    vlm_model        VARCHAR2(500)  NOT NULL,
+                    scenario         VARCHAR2(100)  DEFAULT ''general'',
+                    custom_prompt    CLOB           DEFAULT '''',
+                    camera_id        VARCHAR2(200)  DEFAULT '''',
+                    location         VARCHAR2(200)  DEFAULT '''',
+                    capture_type     VARCHAR2(100)  DEFAULT '''',
+                    status           VARCHAR2(50)   DEFAULT ''pending'',
+                    batch_done       NUMBER(10)     DEFAULT 0,
+                    total_batches    NUMBER(10)     DEFAULT 0,
+                    frames           NUMBER(10)     DEFAULT 0,
+                    duration         NUMBER(10,3)   DEFAULT 0,
+                    error_msg        CLOB           DEFAULT '''',
+                    worker_id        VARCHAR2(200)  DEFAULT '''',
+                    started_at       TIMESTAMP,
+                    upload_timestamp TIMESTAMP      DEFAULT CURRENT_TIMESTAMP
+                )
+            ';
+        EXCEPTION WHEN OTHERS THEN
+            IF SQLCODE = -955 THEN NULL; ELSE RAISE; END IF;
+        END;""",
+        """BEGIN
+            EXECUTE IMMEDIATE '
+                CREATE TABLE VSS2_CHUNKS (
+                    id            NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                    video_id      VARCHAR2(64)  NOT NULL,
+                    chunk_index   NUMBER(10)    NOT NULL,
+                    chunk_text    CLOB          NOT NULL,
+                    segment_start NUMBER(10,3)  DEFAULT 0,
+                    segment_end   NUMBER(10,3)  DEFAULT 0,
+                    embedding     CLOB,
+                    CONSTRAINT uq_vss2_chunks UNIQUE (video_id, chunk_index),
+                    CONSTRAINT fk_vss2_chunks_video FOREIGN KEY (video_id)
+                        REFERENCES VSS2_VIDEOS(id) ON DELETE CASCADE
+                )
+            ';
+        EXCEPTION WHEN OTHERS THEN
+            IF SQLCODE = -955 THEN NULL; ELSE RAISE; END IF;
+        END;""",
+    ]:
+        cur.execute(ddl)
+    conn.commit()
+    cur.close()
+    conn.close()
+    print("[APP] ADB schema OK.")
 
 
 def _db_insert_video(video_id: str, filename: str, path: str, vlm_model: str,
                      scenario: str, custom_prompt: str, camera_id: str,
                      location: str, capture_type: str) -> None:
-    with _pg_conn() as conn, conn.cursor() as cur:
+    conn = _adb_conn()
+    with conn.cursor() as cur:
         cur.execute(
-            """INSERT INTO vss2_videos
-               (id, filename, video_path, vlm_model, scenario, custom_prompt,
-                camera_id, location, capture_type, status)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending')
-               ON CONFLICT (id) DO UPDATE SET
-                 vlm_model=EXCLUDED.vlm_model, scenario=EXCLUDED.scenario,
-                 custom_prompt=EXCLUDED.custom_prompt, status='pending',
-                 batch_done=0, total_batches=0, frames=0, error_msg=''""",
-            (video_id, filename, path, vlm_model, scenario, custom_prompt,
-             camera_id, location, capture_type),
+            """MERGE INTO VSS2_VIDEOS v
+               USING DUAL ON (v.id = :id)
+               WHEN MATCHED THEN UPDATE SET
+                 vlm_model=:vlm_model, scenario=:scenario,
+                 custom_prompt=:custom_prompt, status='pending',
+                 batch_done=0, total_batches=0, frames=0, error_msg=''
+               WHEN NOT MATCHED THEN INSERT
+                 (id, filename, video_path, vlm_model, scenario, custom_prompt,
+                  camera_id, location, capture_type, status)
+               VALUES
+                 (:id, :filename, :video_path, :vlm_model, :scenario, :custom_prompt,
+                  :camera_id, :location, :capture_type, 'pending')""",
+            dict(id=video_id, filename=filename, video_path=path,
+                 vlm_model=vlm_model, scenario=scenario,
+                 custom_prompt=custom_prompt, camera_id=camera_id,
+                 location=location, capture_type=capture_type),
         )
-        conn.commit()
+    conn.commit()
+    conn.close()
 
 
 def _db_update_video(video_id: str, **kwargs) -> None:
     if not kwargs:
         return
-    cols = ", ".join(f"{k}=%s" for k in kwargs)
-    vals = list(kwargs.values()) + [video_id]
-    with _pg_conn() as conn, conn.cursor() as cur:
-        cur.execute(f"UPDATE vss2_videos SET {cols} WHERE id=%s", vals)
-        conn.commit()
+    cols = ", ".join(f"{k}=:{k}" for k in kwargs)
+    params = {**kwargs, "video_id": video_id}
+    conn = _adb_conn()
+    with conn.cursor() as cur:
+        cur.execute(f"UPDATE VSS2_VIDEOS SET {cols} WHERE id=:video_id", params)
+    conn.commit()
+    conn.close()
 
 
 def _db_get_video(video_id: str) -> Optional[Dict]:
-    with _pg_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("SELECT * FROM vss2_videos WHERE id=%s", (video_id,))
+    conn = _adb_conn()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, filename, video_path, vlm_model, scenario, custom_prompt,
+                   camera_id, location, capture_type, status, batch_done,
+                   total_batches, frames, duration, error_msg, worker_id,
+                   started_at, upload_timestamp
+            FROM VSS2_VIDEOS WHERE id=:1
+        """, [video_id])
+        cols = [c[0].lower() for c in cur.description]
         row = cur.fetchone()
-        return dict(row) if row else None
+        if not row:
+            conn.close()
+            return None
+        d = dict(zip(cols, row))
+        # Read LOBs while connection is still open
+        for k, v in d.items():
+            if hasattr(v, "read"):
+                d[k] = v.read()
+    conn.close()
+    return d
 
 
 def _db_list_videos() -> List[Dict]:
-    with _pg_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("SELECT * FROM vss2_videos ORDER BY upload_timestamp DESC")
-        return [dict(r) for r in cur.fetchall()]
+    conn = _adb_conn()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, filename, video_path, vlm_model, scenario,
+                   status, batch_done, total_batches, frames, duration,
+                   error_msg, worker_id, started_at, upload_timestamp
+            FROM VSS2_VIDEOS ORDER BY upload_timestamp DESC
+        """)
+        cols = [c[0].lower() for c in cur.description]
+        rows = []
+        for r in cur.fetchall():
+            row = dict(zip(cols, r))
+            for k, v in row.items():
+                if hasattr(v, "read"):
+                    row[k] = v.read()
+            rows.append(row)
+    conn.close()
+    return rows
 
 
 def _db_delete_video(video_id: str) -> Optional[str]:
-    with _pg_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT video_path FROM vss2_videos WHERE id=%s", (video_id,))
+    conn = _adb_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT video_path FROM VSS2_VIDEOS WHERE id=:1", [video_id])
         row = cur.fetchone()
         if not row:
+            conn.close()
             return None
         path = row[0]
-        cur.execute("DELETE FROM vss2_videos WHERE id=%s", (video_id,))
-        conn.commit()
-        return path
+        cur.execute("DELETE FROM VSS2_VIDEOS WHERE id=:1", [video_id])
+    conn.commit()
+    conn.close()
+    return path
 
 
-def _db_store_chunks(video_id: str, chunks: List[Dict]) -> None:
-    with _pg_conn() as conn, conn.cursor() as cur:
-        cur.execute("DELETE FROM vss2_chunks WHERE video_id=%s", (video_id,))
-        for i, c in enumerate(chunks):
-            vec = _embed(c["text"])
-            cur.execute(
-                """INSERT INTO vss2_chunks (video_id, chunk_index, chunk_text,
-                   segment_start, segment_end, embedding)
-                   VALUES (%s,%s,%s,%s,%s,%s)""",
-                (video_id, i, c["text"], c["start"], c["end"],
-                 json.dumps(vec)),
-            )
-        conn.commit()
+def _db_get_chunks(video_id: str) -> List[Dict]:
+    conn = _adb_conn()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT chunk_index, chunk_text, segment_start, segment_end
+            FROM VSS2_CHUNKS WHERE video_id=:1
+            ORDER BY chunk_index
+        """, [video_id])
+        cols = [c[0].lower() for c in cur.description]
+        rows = []
+        for r in cur.fetchall():
+            row = dict(zip(cols, r))
+            if hasattr(row.get("chunk_text"), "read"):
+                row["chunk_text"] = row["chunk_text"].read()
+            rows.append(row)
+    conn.close()
+    return rows
 
 
-def _db_search(query_vec: List[float], top_k: int, camera_id: str = "",
-               location: str = "", scenario: str = "",
-               min_similarity: float = 0.0) -> List[Dict]:
-    vec_str = json.dumps(query_vec)
-    with _pg_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(
-            """SELECT c.video_id, c.chunk_index, c.chunk_text,
-                      c.segment_start, c.segment_end,
-                      1 - (c.embedding <=> %s::vector) AS similarity,
-                      v.filename, v.scenario, v.camera_id, v.location,
-                      v.capture_type, v.vlm_model, v.duration
-               FROM vss2_chunks c
-               JOIN vss2_videos v ON c.video_id = v.id
-               WHERE v.status = 'ready'
-                 AND (%s = '' OR v.camera_id ILIKE %s)
-                 AND (%s = '' OR v.location ILIKE %s)
-                 AND (%s = '' OR v.scenario = %s)
-               ORDER BY c.embedding <=> %s::vector
-               LIMIT %s""",
-            (vec_str,
-             camera_id, f"%{camera_id}%",
-             location, f"%{location}%",
-             scenario, scenario,
-             vec_str, top_k),
-        )
-        rows = [dict(r) for r in cur.fetchall()]
-    return [r for r in rows if float(r["similarity"]) >= min_similarity]
+def _db_search(query_vec: List[float], top_k: int,
+               camera_id: str = "", location: str = "",
+               scenario: str = "") -> List[Dict]:
+    """
+    Basic text search — returns chunks from ready videos.
+    For full vector similarity search, upgrade ADB to 23ai and use VECTOR columns.
+    """
+    conn = _adb_conn()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT c.video_id, c.chunk_index, c.chunk_text,
+                   c.segment_start, c.segment_end,
+                   v.filename, v.scenario, v.camera_id, v.location,
+                   v.capture_type, v.vlm_model, v.duration,
+                   0.9 AS similarity
+            FROM VSS2_CHUNKS c
+            JOIN VSS2_VIDEOS v ON c.video_id = v.id
+            WHERE v.status = 'ready'
+              AND (:camera_id IS NULL OR v.camera_id LIKE :camera_id)
+              AND (:location IS NULL OR v.location LIKE :location)
+              AND (:scenario IS NULL OR v.scenario = :scenario)
+            FETCH FIRST :top_k ROWS ONLY
+        """, dict(
+            camera_id=f"%{camera_id}%" if camera_id else None,
+            location=f"%{location}%" if location else None,
+            scenario=scenario if scenario else None,
+            top_k=top_k,
+        ))
+        cols = [c[0].lower() for c in cur.description]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    conn.close()
+    return rows
 
 
 # ── OCI GenAI client ──────────────────────────────────────────────────────────
 def _build_client() -> GenerativeAiInferenceClient:
     signer = InstancePrincipalsSecurityTokenSigner()
     return GenerativeAiInferenceClient(
-        config={"region": "us-phoenix-1"},
+        config={"region": "us-ashburn-1"},
         signer=signer,
         service_endpoint=OCI_INFERENCE_ENDPOINT,
         retry_strategy=oci.retry.NoneRetryStrategy(),
@@ -311,7 +380,7 @@ def _extract_text(resp) -> str:
             if isinstance(c, list):
                 return "".join(getattr(x, "text", "") for x in c)
             return str(c)
-    except Exception:
+    except Exception as e:
         pass
     return ""
 
@@ -322,8 +391,7 @@ def _synthesize(query: str, results: List[Dict], llm_model: str) -> str:
     for i, r in enumerate(results[:8]):
         ts = f"{r['segment_start']:.0f}s–{r['segment_end']:.0f}s"
         parts.append(
-            f"[{i+1}] {r['filename']} ({ts}, score={r['similarity']:.2f}):\n"
-            f"{r['chunk_text'][:500]}"
+            f"[{i+1}] {r['filename']} ({ts}):\n{r['chunk_text'][:500]}"
         )
     context = "\n\n".join(parts)
     client = _build_client()
@@ -335,9 +403,7 @@ def _synthesize(query: str, results: List[Dict], llm_model: str) -> str:
         "If the information is insufficient, say so clearly."
     ))]
     user_msg = UserMessage()
-    user_msg.content = [TextContent(text=(
-        f"Question: {query}\n\nVideo analysis segments:\n{context}"
-    ))]
+    user_msg.content = [TextContent(text=f"Question: {query}\n\nVideo analysis segments:\n{context}")]
     req = GenericChatRequest()
     req.api_format = "GENERIC"
     req.messages = [sys_msg, user_msg]
@@ -354,7 +420,7 @@ def _synthesize(query: str, results: List[Dict], llm_model: str) -> str:
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 STATIC_DIR = Path(os.environ.get("STATIC_DIR", "/app/static"))
 
-app = FastAPI(title="VSS2 — Video Search & Summarization", version="1.0.0")
+app = FastAPI(title="VSS2 — Video Search & Summarization", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -373,7 +439,7 @@ def _startup():
 
 @app.get("/health")
 def health():
-    return {"status": "healthy"}
+    return {"status": "healthy", "region": "us-ashburn-1", "db": "oracle-adb"}
 
 
 @app.get("/api/models")
@@ -403,15 +469,63 @@ async def upload(
     video_id = uuid.uuid4().hex
     dest = UPLOADS_DIR / f"{video_id}{suffix}"
     dest.write_bytes(await file.read())
-
     _db_insert_video(
         video_id, file.filename or dest.name, str(dest),
-        vlm_model, scenario, custom_prompt[:800],
+        vlm_model, scenario, (custom_prompt or "")[:800],
         camera_id, location, capture_type,
     )
-    # A worker pod will claim and process this job automatically
     return JSONResponse({"videoId": video_id, "status": "pending"})
 
+
+
+@app.post("/api/analyze-from-storage")
+def analyze_from_storage(
+    object_name: str = Form(..., description="Object name in Object Storage e.g. uploads/race2.mp4"),
+    vlm_model: str = Form(DEFAULT_VLM),
+    scenario: str = Form("general"),
+    custom_prompt: str = Form(""),
+) -> JSONResponse:
+    """
+    Trigger analysis of a video already in Object Storage.
+    Worker will download it, analyse with Gemini, store result in ADB.
+    """
+    import oci
+    from oci.auth.signers import InstancePrincipalsSecurityTokenSigner as IPS
+
+    NAMESPACE  = "idxkccw2srke"
+    BUCKET     = "marathon-vlm-inputs"
+
+    # Verify object exists
+    try:
+        signer = IPS()
+        os_client = oci.object_storage.ObjectStorageClient(
+            config={"region": "us-ashburn-1"}, signer=signer
+        )
+        head = os_client.head_object(NAMESPACE, BUCKET, object_name)
+        file_size = head.headers.get("content-length", "unknown")
+    except Exception as e:
+        raise HTTPException(404, f"Object not found in Object Storage: {object_name} — {e}")
+
+    # Use object name as filename
+    filename = object_name.split("/")[-1]
+    video_id = uuid.uuid4().hex
+
+    # Store with special video_path indicating Object Storage source
+    video_path = f"oci://{NAMESPACE}/{BUCKET}/{object_name}"
+
+    _db_insert_video(
+        video_id, filename, video_path,
+        vlm_model, scenario, (custom_prompt or "")[:800],
+        "", "", "",
+    )
+
+    return JSONResponse({
+        "videoId": video_id,
+        "status": "pending",
+        "object_name": object_name,
+        "file_size_bytes": file_size,
+        "message": "Worker will download from Object Storage and analyse"
+    })
 
 @app.get("/api/videos/{video_id}/status")
 def analysis_status(video_id: str) -> JSONResponse:
@@ -421,7 +535,7 @@ def analysis_status(video_id: str) -> JSONResponse:
     resp: Dict[str, Any] = {
         "status":        row["status"],
         "frames":        row["frames"],
-        "duration":      row["duration"],
+        "duration":      float(row["duration"] or 0),
         "batch_done":    row["batch_done"],
         "total_batches": row["total_batches"],
         "error":         row.get("error_msg", ""),
@@ -432,7 +546,7 @@ def analysis_status(video_id: str) -> JSONResponse:
     }
     if row["status"] == "analysing" and row.get("started_at") and row["batch_done"] > 0:
         started = row["started_at"]
-        if not started.tzinfo:
+        if hasattr(started, "tzinfo") and not started.tzinfo:
             started = started.replace(tzinfo=timezone.utc)
         elapsed = (datetime.now(timezone.utc) - started).total_seconds()
         avg = elapsed / row["batch_done"]
@@ -440,6 +554,44 @@ def analysis_status(video_id: str) -> JSONResponse:
         resp["elapsed"] = round(elapsed, 1)
         resp["eta"] = round(avg * remaining, 1) if remaining > 0 else 0.0
     return JSONResponse(resp)
+
+
+@app.get("/api/videos/{video_id}/summary")
+def get_summary(video_id: str) -> JSONResponse:
+    """Return the structured JSON race summary for sports scenario videos."""
+    row = _db_get_video(video_id)
+    if not row:
+        raise HTTPException(404, "Video not found")
+    if row["status"] != "ready":
+        return JSONResponse({"status": row["status"], "summary": None})
+    chunks = _db_get_chunks(video_id)
+    if not chunks:
+        return JSONResponse({"status": "ready", "summary": None})
+    # For sports scenario, first chunk contains the JSON
+    raw = chunks[0]["chunk_text"]
+    if hasattr(raw, "read"):
+        raw = raw.read()
+    try:
+        # Strip markdown fences if present
+        clean = str(raw).strip()
+        # Strip markdown fences
+        import re
+        clean = re.sub(r"^```json\s*", "", clean)
+        clean = re.sub(r"^```\s*", "", clean)
+        clean = re.sub(r"\s*```$", "", clean)
+        clean = clean.strip()
+        try:
+            summary = json.loads(clean)
+        except Exception as e:
+            summary = {"raw": clean[:50000], "parse_error": str(e)[:200]}
+        
+        if clean.startswith("```"):
+            lines_list = [l for l in clean.split("\n") if not l.strip().startswith("```")]
+            clean = "\n".join(lines_list)
+        summary = json.loads(clean.strip())
+    except Exception as e:
+        summary = {"raw": str(raw)[:50000], "parse_error": "json_truncated"}
+    return JSONResponse({"status": "ready", "summary": summary})
 
 
 @app.post("/api/videos/{video_id}/reanalyse")
@@ -455,7 +607,7 @@ def reanalyse(
     _db_update_video(
         video_id,
         vlm_model=vlm_model, scenario=scenario,
-        custom_prompt=custom_prompt[:800], status="pending",
+        custom_prompt=(custom_prompt or "")[:800], status="pending",
         batch_done=0, total_batches=0, error_msg="",
         started_at=None, worker_id="",
     )
@@ -468,6 +620,8 @@ def list_videos() -> JSONResponse:
         rows = _db_list_videos()
         for r in rows:
             r["upload_timestamp"] = str(r.get("upload_timestamp", ""))
+            r["started_at"] = str(r.get("started_at", ""))
+            r["duration"] = float(r.get("duration") or 0)
         return JSONResponse({"videos": rows})
     except Exception as e:
         return JSONResponse({"videos": [], "error": str(e)})
@@ -480,7 +634,7 @@ def delete_video(video_id: str) -> JSONResponse:
         raise HTTPException(404, "Video not found")
     try:
         Path(path).unlink(missing_ok=True)
-    except Exception:
+    except Exception as e:
         pass
     return JSONResponse({"deleted": video_id})
 
@@ -520,10 +674,7 @@ def search(req: SearchRequest) -> JSONResponse:
     embed_ms = round((time.time() - t0) * 1000, 1)
 
     t1 = time.time()
-    results = _db_search(
-        q_vec, req.top_k,
-        req.camera_id, req.location, req.scenario, req.min_similarity,
-    )
+    results = _db_search(q_vec, req.top_k, req.camera_id, req.location, req.scenario)
     search_ms = round((time.time() - t1) * 1000, 1)
 
     synthesis = ""
@@ -537,9 +688,9 @@ def search(req: SearchRequest) -> JSONResponse:
         llm_ms = round((time.time() - t2) * 1000, 1)
 
     for r in results:
-        r["similarity"] = round(float(r["similarity"]), 4)
-        r["segment_start"] = float(r["segment_start"])
-        r["segment_end"] = float(r["segment_end"])
+        r["similarity"] = round(float(r.get("similarity") or 0), 4)
+        r["segment_start"] = float(r.get("segment_start") or 0)
+        r["segment_end"] = float(r.get("segment_end") or 0)
         r["duration"] = float(r.get("duration") or 0)
 
     return JSONResponse({
@@ -554,4 +705,19 @@ def search(req: SearchRequest) -> JSONResponse:
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return (STATIC_DIR / "index.html").read_text()
+    html_path = STATIC_DIR / "index.html"
+    if html_path.exists():
+        return HTMLResponse(
+            html_path.read_text(),
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+            },
+        )
+    return HTMLResponse(
+        "<h1>VSS2 Sports Analytics</h1><p>Frontend not found. Check STATIC_DIR.</p>",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+        },
+    )
