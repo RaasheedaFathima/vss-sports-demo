@@ -46,3 +46,4 @@ fastembed-cache/
 
 # Logs
 *.log
+.env
