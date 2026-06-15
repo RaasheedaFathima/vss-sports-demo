@@ -24,7 +24,7 @@ import requests
 from fastembed import TextEmbedding
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from oci.auth.signers import InstancePrincipalsSecurityTokenSigner
 from oci.generative_ai_inference import GenerativeAiInferenceClient
 from oci.generative_ai_inference.models import (
@@ -57,6 +57,10 @@ LOCAL_COSMOS_API_KEY  = os.environ.get("LOCAL_COSMOS_API_KEY", "")
 LOCAL_COSMOS_MODEL    = os.environ.get("LOCAL_COSMOS_MODEL", "nvidia/cosmos-reason2-8b")
 
 OCI_INFERENCE_ENDPOINT = "https://inference.generativeai.us-ashburn-1.oci.oraclecloud.com"
+OBJECT_STORAGE_NAMESPACE = os.environ.get("OBJECT_STORAGE_NAMESPACE", "idxkccw2srke")
+OBJECT_STORAGE_BUCKET = os.environ.get("OBJECT_STORAGE_BUCKET", "marathon-vlm-inputs")
+OBJECT_STORAGE_REGION = os.environ.get("OBJECT_STORAGE_REGION", "us-ashburn-1")
+OBJECT_STORAGE_PREFIX = os.environ.get("OBJECT_STORAGE_PREFIX", "uploads/")
 
 # ── Model catalogue ───────────────────────────────────────────────────────────
 VLM_MODELS = [
@@ -101,10 +105,13 @@ SCENARIO_PROMPTS: Dict[str, str] = {
         "  \"winner\": {\"name\": null, \"bib\": null, \"country\": null, \"finish_time\": null},\n"
         "  \"runners\": [{\"name\": null, \"bib\": \"string\", \"country\": null, "
         "\"position\": number, \"finish_time\": null, \"notable_events\": []}],\n"
+        "  \"second_by_second\": [{\"second\": number, \"timestamp\": \"MM:SS\", "
+        "\"description\": \"what is visible or spoken during that exact second\"}],\n"
         "  \"commentary\": [{\"timestamp\": \"HH:MM:SS\", \"event\": \"string\"}],\n"
         "  \"confidence\": \"high|medium|low\",\n"
         "  \"notes\": \"string\"\n"
         "}\n\n"
+        "Populate second_by_second for every second from 0 through the visible race duration. "
         "Use null for values you cannot determine. No markdown, no explanation, JSON only."
     ),
     "retail": (
@@ -136,6 +143,20 @@ def _get_embed_model() -> TextEmbedding:
 
 def _embed(text: str) -> List[float]:
     return list(_get_embed_model().embed([text]))[0].tolist()
+
+
+# ── JSON normalization ───────────────────────────────────────────────────────
+def _json_safe(value: Any) -> Any:
+    """Convert Oracle driver objects into plain JSON-serializable values."""
+    if hasattr(value, "read"):
+        return value.read()
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    return value
 
 
 # ── ADB helpers ───────────────────────────────────────────────────────────────
@@ -259,16 +280,12 @@ def _db_get_video(video_id: str) -> Optional[Dict]:
         """, [video_id])
         cols = [c[0].lower() for c in cur.description]
         row = cur.fetchone()
-        if not row:
-            conn.close()
-            return None
-        d = dict(zip(cols, row))
-        # Read LOBs while connection is still open
-        for k, v in d.items():
-            if hasattr(v, "read"):
-                d[k] = v.read()
+    if not row:
+        conn.close()
+        return None
+    result = _json_safe(dict(zip(cols, row)))
     conn.close()
-    return d
+    return result
 
 
 def _db_list_videos() -> List[Dict]:
@@ -281,13 +298,7 @@ def _db_list_videos() -> List[Dict]:
             FROM VSS2_VIDEOS ORDER BY upload_timestamp DESC
         """)
         cols = [c[0].lower() for c in cur.description]
-        rows = []
-        for r in cur.fetchall():
-            row = dict(zip(cols, r))
-            for k, v in row.items():
-                if hasattr(v, "read"):
-                    row[k] = v.read()
-            rows.append(row)
+        rows = [_json_safe(dict(zip(cols, r))) for r in cur.fetchall()]
     conn.close()
     return rows
 
@@ -328,7 +339,7 @@ def _db_get_chunks(video_id: str) -> List[Dict]:
 
 def _db_search(query_vec: List[float], top_k: int,
                camera_id: str = "", location: str = "",
-               scenario: str = "") -> List[Dict]:
+               scenario: str = "", video_id: str = "") -> List[Dict]:
     """
     Basic text search — returns chunks from ready videos.
     For full vector similarity search, upgrade ADB to 23ai and use VECTOR columns.
@@ -344,18 +355,50 @@ def _db_search(query_vec: List[float], top_k: int,
             FROM VSS2_CHUNKS c
             JOIN VSS2_VIDEOS v ON c.video_id = v.id
             WHERE v.status = 'ready'
+              AND (:video_id IS NULL OR c.video_id = :video_id)
               AND (:camera_id IS NULL OR v.camera_id LIKE :camera_id)
               AND (:location IS NULL OR v.location LIKE :location)
               AND (:scenario IS NULL OR v.scenario = :scenario)
             FETCH FIRST :top_k ROWS ONLY
         """, dict(
+            video_id=video_id if video_id else None,
             camera_id=f"%{camera_id}%" if camera_id else None,
             location=f"%{location}%" if location else None,
             scenario=scenario if scenario else None,
             top_k=top_k,
         ))
         cols = [c[0].lower() for c in cur.description]
-        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        rows = [_json_safe(dict(zip(cols, r))) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def _estimate_tokens(text: Any) -> int:
+    if text is None:
+        return 0
+    return max(1, round(len(str(text)) / 4))
+
+
+def _db_audit(limit: int = 50) -> List[Dict]:
+    conn = _adb_conn()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT v.id, v.filename, v.video_path, v.vlm_model, v.scenario,
+                   v.status, v.batch_done, v.total_batches, v.frames, v.duration,
+                   v.error_msg, v.worker_id, v.started_at, v.upload_timestamp,
+                   DBMS_LOB.GETLENGTH(v.custom_prompt) AS prompt_chars,
+                   (SELECT COUNT(*)
+                      FROM VSS2_CHUNKS c
+                     WHERE c.video_id = v.id) AS chunk_count,
+                   (SELECT NVL(SUM(DBMS_LOB.GETLENGTH(c.chunk_text)), 0)
+                      FROM VSS2_CHUNKS c
+                     WHERE c.video_id = v.id) AS output_chars
+            FROM VSS2_VIDEOS v
+            ORDER BY v.upload_timestamp DESC
+            FETCH FIRST :limit ROWS ONLY
+        """, {"limit": limit})
+        cols = [c[0].lower() for c in cur.description]
+        rows = [_json_safe(dict(zip(cols, r))) for r in cur.fetchall()]
     conn.close()
     return rows
 
@@ -380,18 +423,26 @@ def _extract_text(resp) -> str:
             if isinstance(c, list):
                 return "".join(getattr(x, "text", "") for x in c)
             return str(c)
-    except Exception as e:
+    except Exception:
         pass
     return ""
 
 
 # ── LLM synthesis ─────────────────────────────────────────────────────────────
+def _clip_context(text: str, limit: int = 7000) -> str:
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    edge = max(1000, limit // 2)
+    return f"{text[:edge]}\n\n[...middle omitted for brevity...]\n\n{text[-edge:]}"
+
+
 def _synthesize(query: str, results: List[Dict], llm_model: str) -> str:
     parts = []
     for i, r in enumerate(results[:8]):
         ts = f"{r['segment_start']:.0f}s–{r['segment_end']:.0f}s"
         parts.append(
-            f"[{i+1}] {r['filename']} ({ts}):\n{r['chunk_text'][:500]}"
+            f"[{i+1}] {r['filename']} ({ts}):\n{_clip_context(r.get('chunk_text', ''))}"
         )
     context = "\n\n".join(parts)
     client = _build_client()
@@ -455,6 +506,121 @@ def scenarios():
     ]}
 
 
+def _object_storage_client():
+    signer = InstancePrincipalsSecurityTokenSigner()
+    return oci.object_storage.ObjectStorageClient(
+        config={"region": OBJECT_STORAGE_REGION},
+        signer=signer,
+    )
+
+
+def _safe_object_name(filename: str) -> str:
+    base = Path(filename or "race-video.mp4").name.strip() or "race-video.mp4"
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in base)
+    safe = safe.strip("-") or "race-video.mp4"
+    prefix = OBJECT_STORAGE_PREFIX.strip("/")
+    return f"{prefix}/{uuid.uuid4().hex}-{safe}" if prefix else f"{uuid.uuid4().hex}-{safe}"
+
+
+def _parse_oci_uri(uri: str):
+    raw = uri.replace("oci://", "", 1)
+    parts = raw.split("/", 2)
+    if len(parts) != 3:
+        raise HTTPException(500, "Invalid Object Storage URI stored for video.")
+    return parts[0], parts[1], parts[2]
+
+
+def _queue_object_storage_video(
+    object_name: str,
+    filename: str,
+    vlm_model: str,
+    scenario: str,
+    custom_prompt: str,
+    camera_id: str = "",
+    location: str = "",
+    capture_type: str = "",
+):
+    video_id = uuid.uuid4().hex
+    video_path = f"oci://{OBJECT_STORAGE_NAMESPACE}/{OBJECT_STORAGE_BUCKET}/{object_name}"
+    _db_insert_video(
+        video_id, filename, video_path,
+        vlm_model, scenario, (custom_prompt or "")[:800],
+        camera_id, location, capture_type,
+    )
+    return video_id, video_path
+
+
+@app.post("/api/upload-to-storage")
+async def upload_to_storage(
+    file: UploadFile = File(...),
+    vlm_model: str = Form(DEFAULT_VLM),
+    scenario: str = Form("sports"),
+    custom_prompt: str = Form(""),
+    camera_id: str = Form(""),
+    location: str = Form(""),
+    capture_type: str = Form("sports"),
+) -> JSONResponse:
+    payload = await file.read()
+    if not payload:
+        raise HTTPException(400, "Uploaded video is empty.")
+
+    object_name = _safe_object_name(file.filename or "race-video.mp4")
+    try:
+        _object_storage_client().put_object(
+            OBJECT_STORAGE_NAMESPACE,
+            OBJECT_STORAGE_BUCKET,
+            object_name,
+            payload,
+            content_type=file.content_type or "application/octet-stream",
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"Object Storage upload failed: {exc}") from exc
+
+    return JSONResponse({
+        "status": "uploaded",
+        "object_name": object_name,
+        "bucket": OBJECT_STORAGE_BUCKET,
+        "file_size_bytes": len(payload),
+        "message": "Uploaded to Object Storage. Call /api/analyze-from-storage to queue analysis.",
+    })
+
+
+@app.post("/api/analyze-from-storage")
+def analyze_from_storage(
+    object_name: str = Form(..., description="Object name in Object Storage e.g. uploads/race.mp4"),
+    vlm_model: str = Form(DEFAULT_VLM),
+    scenario: str = Form("sports"),
+    custom_prompt: str = Form(""),
+) -> JSONResponse:
+    try:
+        head = _object_storage_client().head_object(
+            OBJECT_STORAGE_NAMESPACE,
+            OBJECT_STORAGE_BUCKET,
+            object_name,
+        )
+        file_size = head.headers.get("content-length", "unknown")
+    except Exception as exc:
+        raise HTTPException(404, f"Object not found in Object Storage: {object_name} - {exc}") from exc
+
+    filename = object_name.split("/")[-1]
+    video_id, video_path = _queue_object_storage_video(
+        object_name=object_name,
+        filename=filename,
+        vlm_model=vlm_model,
+        scenario=scenario,
+        custom_prompt=custom_prompt,
+    )
+    return JSONResponse({
+        "videoId": video_id,
+        "status": "pending",
+        "object_name": object_name,
+        "video_path": video_path,
+        "bucket": OBJECT_STORAGE_BUCKET,
+        "file_size_bytes": file_size,
+        "message": "Object Storage video queued for analysis",
+    })
+
+
 @app.post("/api/upload")
 async def upload(
     file: UploadFile = File(...),
@@ -476,56 +642,6 @@ async def upload(
     )
     return JSONResponse({"videoId": video_id, "status": "pending"})
 
-
-
-@app.post("/api/analyze-from-storage")
-def analyze_from_storage(
-    object_name: str = Form(..., description="Object name in Object Storage e.g. uploads/race2.mp4"),
-    vlm_model: str = Form(DEFAULT_VLM),
-    scenario: str = Form("general"),
-    custom_prompt: str = Form(""),
-) -> JSONResponse:
-    """
-    Trigger analysis of a video already in Object Storage.
-    Worker will download it, analyse with Gemini, store result in ADB.
-    """
-    import oci
-    from oci.auth.signers import InstancePrincipalsSecurityTokenSigner as IPS
-
-    NAMESPACE  = "idxkccw2srke"
-    BUCKET     = "marathon-vlm-inputs"
-
-    # Verify object exists
-    try:
-        signer = IPS()
-        os_client = oci.object_storage.ObjectStorageClient(
-            config={"region": "us-ashburn-1"}, signer=signer
-        )
-        head = os_client.head_object(NAMESPACE, BUCKET, object_name)
-        file_size = head.headers.get("content-length", "unknown")
-    except Exception as e:
-        raise HTTPException(404, f"Object not found in Object Storage: {object_name} — {e}")
-
-    # Use object name as filename
-    filename = object_name.split("/")[-1]
-    video_id = uuid.uuid4().hex
-
-    # Store with special video_path indicating Object Storage source
-    video_path = f"oci://{NAMESPACE}/{BUCKET}/{object_name}"
-
-    _db_insert_video(
-        video_id, filename, video_path,
-        vlm_model, scenario, (custom_prompt or "")[:800],
-        "", "", "",
-    )
-
-    return JSONResponse({
-        "videoId": video_id,
-        "status": "pending",
-        "object_name": object_name,
-        "file_size_bytes": file_size,
-        "message": "Worker will download from Object Storage and analyse"
-    })
 
 @app.get("/api/videos/{video_id}/status")
 def analysis_status(video_id: str) -> JSONResponse:
@@ -553,7 +669,7 @@ def analysis_status(video_id: str) -> JSONResponse:
         remaining = row["total_batches"] - row["batch_done"]
         resp["elapsed"] = round(elapsed, 1)
         resp["eta"] = round(avg * remaining, 1) if remaining > 0 else 0.0
-    return JSONResponse(resp)
+    return JSONResponse(_json_safe(resp))
 
 
 @app.get("/api/videos/{video_id}/summary")
@@ -574,23 +690,13 @@ def get_summary(video_id: str) -> JSONResponse:
     try:
         # Strip markdown fences if present
         clean = str(raw).strip()
-        # Strip markdown fences
-        import re
-        clean = re.sub(r"^```json\s*", "", clean)
-        clean = re.sub(r"^```\s*", "", clean)
-        clean = re.sub(r"\s*```$", "", clean)
-        clean = clean.strip()
-        try:
-            summary = json.loads(clean)
-        except Exception as e:
-            summary = {"raw": clean[:50000], "parse_error": str(e)[:200]}
-        
         if clean.startswith("```"):
-            lines_list = [l for l in clean.split("\n") if not l.strip().startswith("```")]
-            clean = "\n".join(lines_list)
+            clean = clean.split("```")[1]
+            if clean.startswith("json"):
+                clean = clean[4:]
         summary = json.loads(clean.strip())
-    except Exception as e:
-        summary = {"raw": str(raw)[:50000], "parse_error": "json_truncated"}
+    except Exception:
+        summary = {"raw": str(raw)}
     return JSONResponse({"status": "ready", "summary": summary})
 
 
@@ -627,6 +733,66 @@ def list_videos() -> JSONResponse:
         return JSONResponse({"videos": [], "error": str(e)})
 
 
+@app.get("/api/audit")
+def audit(limit: int = 50) -> JSONResponse:
+    limit = max(1, min(int(limit or 50), 200))
+    rows = _db_audit(limit)
+    analyses = []
+    totals = {
+        "analyses": len(rows),
+        "ready": 0,
+        "pending": 0,
+        "analysing": 0,
+        "error": 0,
+        "output_chars": 0,
+        "estimated_output_tokens": 0,
+        "estimated_prompt_tokens": 0,
+        "estimated_total_text_tokens": 0,
+    }
+    for row in rows:
+        status = row.get("status") or "unknown"
+        if status in totals:
+            totals[status] += 1
+        output_chars = int(row.get("output_chars") or 0)
+        prompt_chars = int(row.get("prompt_chars") or 0)
+        output_tokens = _estimate_tokens("x" * output_chars) if output_chars else 0
+        prompt_tokens = _estimate_tokens("x" * prompt_chars) if prompt_chars else 0
+        total_tokens = output_tokens + prompt_tokens
+        totals["output_chars"] += output_chars
+        totals["estimated_output_tokens"] += output_tokens
+        totals["estimated_prompt_tokens"] += prompt_tokens
+        totals["estimated_total_text_tokens"] += total_tokens
+        video_path = str(row.get("video_path") or "")
+        analyses.append({
+            "video_id": row.get("id"),
+            "filename": row.get("filename"),
+            "status": status,
+            "model": row.get("vlm_model"),
+            "scenario": row.get("scenario"),
+            "duration_seconds": float(row.get("duration") or 0),
+            "batch_done": int(row.get("batch_done") or 0),
+            "total_batches": int(row.get("total_batches") or 0),
+            "frames": int(row.get("frames") or 0),
+            "chunk_count": int(row.get("chunk_count") or 0),
+            "output_chars": output_chars,
+            "estimated_output_tokens": output_tokens,
+            "estimated_prompt_tokens": prompt_tokens,
+            "estimated_total_text_tokens": total_tokens,
+            "storage_source": "Object Storage" if video_path.startswith("oci://") else "VM disk",
+            "worker_id": row.get("worker_id") or "",
+            "started_at": row.get("started_at"),
+            "upload_timestamp": row.get("upload_timestamp"),
+            "error": row.get("error_msg") or "",
+        })
+    return JSONResponse(_json_safe({
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "limit": limit,
+        "token_accounting": "estimated_from_stored_text; OCI GenAI request/vision token usage was not stored historically",
+        "totals": totals,
+        "analyses": analyses,
+    }))
+
+
 @app.delete("/api/videos/{video_id}")
 def delete_video(video_id: str) -> JSONResponse:
     path = _db_delete_video(video_id)
@@ -634,7 +800,7 @@ def delete_video(video_id: str) -> JSONResponse:
         raise HTTPException(404, "Video not found")
     try:
         Path(path).unlink(missing_ok=True)
-    except Exception as e:
+    except Exception:
         pass
     return JSONResponse({"deleted": video_id})
 
@@ -644,7 +810,19 @@ def stream_video(video_id: str):
     row = _db_get_video(video_id)
     if not row:
         raise HTTPException(404, "Video not found")
-    path = Path(row["video_path"])
+    raw_path = str(_json_safe(row["video_path"]))
+    if raw_path.startswith("oci://"):
+        namespace, bucket, object_name = _parse_oci_uri(raw_path)
+        try:
+            response = _object_storage_client().get_object(namespace, bucket, object_name)
+        except Exception as exc:
+            raise HTTPException(404, f"Video object not found: {exc}") from exc
+        return StreamingResponse(
+            response.data.raw.stream(1024 * 1024, decode_content=False),
+            media_type="video/mp4",
+            headers={"Accept-Ranges": "bytes"},
+        )
+    path = Path(raw_path)
     if not path.exists():
         raise HTTPException(404, "Video file not found on disk")
     return FileResponse(
@@ -663,6 +841,7 @@ class SearchRequest(BaseModel):
     camera_id: str = ""
     location: str = ""
     scenario: str = ""
+    video_id: str = ""
 
 
 @app.post("/api/search")
@@ -674,7 +853,7 @@ def search(req: SearchRequest) -> JSONResponse:
     embed_ms = round((time.time() - t0) * 1000, 1)
 
     t1 = time.time()
-    results = _db_search(q_vec, req.top_k, req.camera_id, req.location, req.scenario)
+    results = _db_search(q_vec, req.top_k, req.camera_id, req.location, req.scenario, req.video_id)
     search_ms = round((time.time() - t1) * 1000, 1)
 
     synthesis = ""
@@ -693,14 +872,14 @@ def search(req: SearchRequest) -> JSONResponse:
         r["segment_end"] = float(r.get("segment_end") or 0)
         r["duration"] = float(r.get("duration") or 0)
 
-    return JSONResponse({
+    return JSONResponse(_json_safe({
         "results": results,
         "synthesis": synthesis,
         "total": len(results),
         "embed_ms": embed_ms,
         "search_ms": search_ms,
         "llm_ms": llm_ms,
-    })
+    }))
 
 
 @app.get("/", response_class=HTMLResponse)
