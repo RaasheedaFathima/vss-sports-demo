@@ -1,0 +1,57 @@
+name: vss2-docker-image-project
+
+x-vss2-env: &vss2-env
+  ADB_USER: ${ADB_USER:-}
+  ADB_PASSWORD: ${ADB_PASSWORD:-}
+  ADB_DSN: ${ADB_DSN:-}
+  ADB_WALLET_DIR: ${ADB_WALLET_DIR:-/wallet}
+  TNS_ADMIN: ${ADB_WALLET_DIR:-/wallet}
+  COMPARTMENT_ID: ${COMPARTMENT_ID:-}
+  GEMINI_25_PRO_OCID: ${GEMINI_25_PRO_OCID:-}
+  GEMINI_25_FLASH_OCID: ${GEMINI_25_FLASH_OCID:-}
+  COHERE_CMD_A_VISION: ${COHERE_CMD_A_VISION:-}
+  NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
+  COSMOS_REASON2_MODEL: ${COSMOS_REASON2_MODEL:-nvidia/cosmos-reason2-8b}
+  NVIDIA_NIM_ENDPOINT: ${NVIDIA_NIM_ENDPOINT:-https://integrate.api.nvidia.com/v1/chat/completions}
+  LOCAL_COSMOS_ENDPOINT: ${LOCAL_COSMOS_ENDPOINT:-}
+  LOCAL_COSMOS_API_KEY: ${LOCAL_COSMOS_API_KEY:-}
+  LOCAL_COSMOS_MODEL: ${LOCAL_COSMOS_MODEL:-nvidia/cosmos-reason2-8b}
+  UPLOADS_DIR: /data/uploads
+  FASTEMBED_CACHE_DIR: /data/fastembed-cache
+
+services:
+  app:
+    image: ${CONTAINER_REGISTRY:-ocir.us-ashburn-1.oci.oraclecloud.com}/${TENANCY_NAMESPACE:-idxkccw2srke}/${IMAGE_NAME:-ai_demo}:${IMAGE_TAG:-demo}
+    build:
+      context: ..
+      dockerfile: docker_image_project/Dockerfile
+    environment:
+      <<: *vss2-env
+      STATIC_DIR: /app/static
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    volumes:
+      - vss2_uploads:/data/uploads
+      - vss2_fastembed_cache:/data/fastembed-cache
+      - ${ADB_WALLET_HOST_DIR:-./wallet}:${ADB_WALLET_DIR:-/wallet}:ro
+    init: true
+    restart: unless-stopped
+
+  worker:
+    image: ${CONTAINER_REGISTRY:-ocir.us-ashburn-1.oci.oraclecloud.com}/${TENANCY_NAMESPACE:-idxkccw2srke}/${IMAGE_NAME:-ai_demo}:${IMAGE_TAG:-demo}
+    command: ["python3", "worker.py"]
+    environment:
+      <<: *vss2-env
+    volumes:
+      - vss2_uploads:/data/uploads
+      - vss2_fastembed_cache:/data/fastembed-cache
+      - ${ADB_WALLET_HOST_DIR:-./wallet}:${ADB_WALLET_DIR:-/wallet}:ro
+    depends_on:
+      - app
+    init: true
+    restart: unless-stopped
+
+volumes:
+  vss2_uploads:
+  vss2_fastembed_cache:

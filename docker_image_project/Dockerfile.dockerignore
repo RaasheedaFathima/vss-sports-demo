@@ -1,0 +1,9 @@
+**
+!app/
+!app/main.py
+!app/requirements.txt
+!worker/
+!worker/worker.py
+!worker/requirements.txt
+!frontend/
+!frontend/index.html
